@@ -108,7 +108,9 @@ pub struct WorkflowRun {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiState {
-    /// Completed without passing or failing; counts as passing.
+    /// Completed without a verdict (cancelled, skipped, ...). Never failing:
+    /// health checks treat it as passing, but it ranks below `Success` so a
+    /// rollup is neutral only when every check is.
     Neutral(NeutralKind),
     Success,
     Running,

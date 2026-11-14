@@ -442,13 +442,14 @@ fn pill(bg: Rgba, fg: Rgba, text: impl Into<SharedString>) -> impl IntoElement {
 }
 
 fn ci_pill(theme: Theme, state: CiState) -> impl IntoElement {
-    let colour = match state {
-        CiState::Neutral(_) => return pill(theme.surface, mocha::overlay0(), state.label()),
-        CiState::Success => mocha::green(),
-        CiState::Running => mocha::yellow(),
-        CiState::Failure => mocha::red(),
+    let tinted = |colour: Rgba| (Rgba { a: 0.18, ..colour }, colour);
+    let (bg, fg) = match state {
+        CiState::Neutral(_) => (theme.surface, mocha::overlay0()),
+        CiState::Success => tinted(mocha::green()),
+        CiState::Running => tinted(mocha::yellow()),
+        CiState::Failure => tinted(mocha::red()),
     };
-    pill(Rgba { a: 0.18, ..colour }, colour, state.label())
+    pill(bg, fg, state.label())
 }
 
 /// A pull request's checks; a grey `no checks` pill without CI, so every
