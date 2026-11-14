@@ -19,17 +19,16 @@ pub struct Repo {
 
 impl Repo {
     /// Parses `owner/name`, `https://github.com/owner/name` (optionally
-    /// ending in `/` or `.git`) or `git@github.com:owner/name[.git]`, keeping
-    /// the spelling given. Any other host or a deeper URL is an error.
+    /// ending in `/`) or `git@github.com:owner/name`, each optionally ending
+    /// in `.git`. Any other host or a deeper URL is an error. The result is
+    /// always `owner/name`, with the owner and name capitalised as given.
     pub fn parse(s: &str) -> Result<Self, String> {
         let path = if let Some(rest) = s.strip_prefix("https://github.com/") {
-            let rest = rest.strip_suffix('/').unwrap_or(rest);
-            rest.strip_suffix(".git").unwrap_or(rest)
-        } else if let Some(rest) = s.strip_prefix("git@github.com:") {
-            rest.strip_suffix(".git").unwrap_or(rest)
+            rest.strip_suffix('/').unwrap_or(rest)
         } else {
-            s
+            s.strip_prefix("git@github.com:").unwrap_or(s)
         };
+        let path = path.strip_suffix(".git").unwrap_or(path);
         match path.split_once('/') {
             Some((owner, name)) if is_name(owner) && is_name(name) => Ok(Self {
                 owner: owner.to_owned(),
@@ -411,6 +410,7 @@ mod tests {
     fn parses_github_urls_to_owner_slash_name() {
         for s in [
             "Cerclique/waybar-gpui",
+            "Cerclique/waybar-gpui.git",
             "https://github.com/Cerclique/waybar-gpui",
             "https://github.com/Cerclique/waybar-gpui/",
             "https://github.com/Cerclique/waybar-gpui.git",

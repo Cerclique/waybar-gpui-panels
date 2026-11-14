@@ -8,7 +8,7 @@
 //! Data comes from the daemon's [`Cache`]: an open shows the cached status at
 //! once and refreshes it in the background.
 
-use std::{collections::HashSet, env, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use crate::{
     cache::{Cache, Entry},
@@ -62,11 +62,7 @@ impl Panel for RepoPanel {
     const NAME: &'static str = "repo";
 
     fn new(args: &[String], _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let path = watch_list::path(
-            env::var_os("XDG_CONFIG_HOME").as_deref(),
-            env::home_dir().as_deref(),
-        );
-        let repos = watch_list::load(args, path.as_deref());
+        let repos = watch_list::load(args, watch_list::default_path().as_deref());
         let selected = match &repos {
             Ok(repos) => initial_index(repos, cx.default_global::<LastRepo>().0.as_ref()),
             Err(_) => 0,
