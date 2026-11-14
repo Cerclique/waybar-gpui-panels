@@ -26,6 +26,7 @@ use waybar_gpui::{
         button::{Button, ButtonVariants as _, DropdownButton},
         menu::PopupMenuItem,
         tab::{Tab, TabBar},
+        tooltip::Tooltip,
     },
     gpui::{
         self, AnyElement, App, ClickEvent, Context, FontWeight, Global, IntoElement, Rgba,
@@ -190,14 +191,8 @@ impl Render for RepoPanel {
                 .iter()
                 .map(|i| {
                     link_row(theme, format!("issue-{}", i.number), &i.url)
-                        .child(number(theme, i.number))
-                        .child(title(&i.title))
-                        .children(
-                            i.labels
-                                .iter()
-                                .map(|l| pill(theme.surface, theme.subtext, l.clone())),
-                        )
-                        .child(author(theme, &i.author))
+                        .child(number(theme.subtext, i.number))
+                        .child(title(format!("issue-title-{}", i.number), &i.title))
                         .into_any_element()
                 })
                 .collect(),
@@ -205,14 +200,15 @@ impl Render for RepoPanel {
                 .pulls
                 .iter()
                 .map(|p| {
+                    // A draft is greyed out instead of carrying a pill.
+                    let draft_colour = p.draft.then(mocha::overlay0);
                     link_row(theme, format!("pr-{}", p.number), &p.url)
-                        .child(number(theme, p.number))
-                        .child(title(&p.title))
-                        .when(p.draft, |r| {
-                            r.child(pill(theme.surface, mocha::overlay0(), "draft"))
-                        })
-                        .when_some(p.checks, |r, state| r.child(ci_pill(state)))
-                        .child(author(theme, &p.author))
+                        .child(number(draft_colour.unwrap_or(theme.subtext), p.number))
+                        .child(
+                            title(format!("pr-title-{}", p.number), &p.title)
+                                .when_some(draft_colour, |t, colour| t.text_color(colour)),
+                        )
+                        .child(checks_pill(theme, p.checks))
                         .into_any_element()
                 })
                 .collect(),
@@ -415,24 +411,28 @@ fn link_row(theme: Theme, id: String, url: &str) -> gpui::Stateful<gpui::Div> {
         .on_click(open_and_close(url))
 }
 
-fn number(theme: Theme, number: u64) -> impl IntoElement {
-    div().text_color(theme.subtext).child(format!("#{number}"))
+fn number(colour: Rgba, number: u64) -> impl IntoElement {
+    div().text_color(colour).child(format!("#{number}"))
 }
 
-fn title(title: &str) -> impl IntoElement {
-    div().flex_1().min_w_0().truncate().child(title.to_owned())
-}
-
-fn author(theme: Theme, author: &str) -> impl IntoElement {
+/// A title that takes the row's leftover width, cut with an ellipsis, and
+/// shows in full in a tooltip on hover.
+fn title(id: String, title: &str) -> gpui::Stateful<gpui::Div> {
+    let full = SharedString::from(title.to_owned());
     div()
-        .text_xs()
-        .text_color(theme.subtext)
-        .child(author.to_owned())
+        .id(SharedString::from(id))
+        .flex_1()
+        .min_w_0()
+        .truncate()
+        .child(full.clone())
+        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
 }
 
-/// A small rounded label.
+/// A small rounded label, kept at its natural width.
 fn pill(bg: Rgba, fg: Rgba, text: impl Into<SharedString>) -> impl IntoElement {
     div()
+        .flex_shrink_0()
+        .whitespace_nowrap()
         .px_1p5()
         .rounded_md()
         .text_xs()
@@ -448,6 +448,15 @@ fn ci_pill(state: CiState) -> impl IntoElement {
         CiState::Failure => mocha::red(),
     };
     pill(Rgba { a: 0.18, ..colour }, colour, state.label())
+}
+
+/// A pull request's checks; a grey `no checks` pill without CI, so every
+/// row ends in a pill.
+fn checks_pill(theme: Theme, checks: Option<CiState>) -> AnyElement {
+    match checks {
+        Some(state) => ci_pill(state).into_any_element(),
+        None => pill(theme.surface, mocha::overlay0(), "no checks").into_any_element(),
+    }
 }
 
 fn muted(theme: Theme, text: impl Into<SharedString>) -> impl IntoElement {

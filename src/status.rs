@@ -86,8 +86,6 @@ pub struct Release {
 pub struct Issue {
     pub number: u64,
     pub title: String,
-    pub author: String,
-    pub labels: Vec<String>,
     pub url: String,
 }
 
@@ -95,7 +93,6 @@ pub struct Issue {
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
-    pub author: String,
     pub draft: bool,
     pub checks: Option<CiState>,
     pub url: String,
@@ -222,11 +219,8 @@ fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
         }
     };
     let (issues, pulls, runs, release) = thread::scope(|s| {
-        let issues = s.spawn(list("issue", "number,title,author,labels,url"));
-        let pulls = s.spawn(list(
-            "pr",
-            "number,title,author,isDraft,url,statusCheckRollup",
-        ));
+        let issues = s.spawn(list("issue", "number,title,url"));
+        let pulls = s.spawn(list("pr", "number,title,isDraft,url,statusCheckRollup"));
         let runs = s.spawn(|| {
             run_gh(
                 &[
@@ -282,27 +276,14 @@ fn unexpected_output(e: serde_json::Error) -> GhError {
     GhError::Other(format!("unexpected gh output: {e}"))
 }
 
-/// `author` as `gh … --json author` prints it.
-#[derive(Deserialize)]
-struct GhAuthor {
-    login: String,
-}
-
-#[derive(Deserialize)]
-struct GhLabel {
-    name: String,
-}
-
 #[derive(Deserialize)]
 struct GhIssue {
     number: u64,
     title: String,
-    author: GhAuthor,
-    labels: Vec<GhLabel>,
     url: String,
 }
 
-/// Parses `gh issue list --json number,title,author,labels,url`.
+/// Parses `gh issue list --json number,title,url`.
 pub fn parse_issues(json: &str) -> serde_json::Result<Vec<Issue>> {
     let issues: Vec<GhIssue> = serde_json::from_str(json)?;
     Ok(issues
@@ -310,8 +291,6 @@ pub fn parse_issues(json: &str) -> serde_json::Result<Vec<Issue>> {
         .map(|i| Issue {
             number: i.number,
             title: i.title,
-            author: i.author.login,
-            labels: i.labels.into_iter().map(|l| l.name).collect(),
             url: i.url,
         })
         .collect())
@@ -352,13 +331,12 @@ fn run_state(status: &str, conclusion: &str) -> CiState {
 struct GhPull {
     number: u64,
     title: String,
-    author: GhAuthor,
     is_draft: bool,
     url: String,
     status_check_rollup: Option<Vec<GhCheck>>,
 }
 
-/// Parses `gh pr list --json number,title,author,isDraft,url,statusCheckRollup`.
+/// Parses `gh pr list --json number,title,isDraft,url,statusCheckRollup`.
 /// A pull request's checks are its worst check; `None` without checks.
 pub fn parse_pulls(json: &str) -> serde_json::Result<Vec<PullRequest>> {
     let pulls: Vec<GhPull> = serde_json::from_str(json)?;
@@ -367,7 +345,6 @@ pub fn parse_pulls(json: &str) -> serde_json::Result<Vec<PullRequest>> {
         .map(|p| PullRequest {
             number: p.number,
             title: p.title,
-            author: p.author.login,
             draft: p.is_draft,
             checks: CiState::worst(
                 p.status_check_rollup
@@ -538,8 +515,6 @@ mod tests {
             first.title,
             "[aw] Issue Triage (skills-driven): reported incomplete result"
         );
-        assert_eq!(first.author, "app/cli-triage");
-        assert_eq!(first.labels, ["needs-triage", "agentic-workflows"]);
         assert_eq!(first.url, "https://github.com/cli/cli/issues/15061");
     }
 
@@ -553,7 +528,6 @@ mod tests {
             first.title,
             "githubtemplate: ignore symlinked files in non-legacy template subdirectories"
         );
-        assert_eq!(first.author, "texasich");
         assert!(!first.draft);
         assert_eq!(first.checks, Some(CiState::Success));
         assert_eq!(first.url, "https://github.com/cli/cli/pull/15062");
@@ -568,7 +542,7 @@ mod tests {
     fn a_pull_is_as_bad_as_its_worst_check() {
         let pull = |rollup: &str| {
             let json = format!(
-                r#"[{{"number":1,"title":"t","author":{{"login":"a"}},"isDraft":false,"url":"u","statusCheckRollup":{rollup}}}]"#
+                r#"[{{"number":1,"title":"t","isDraft":false,"url":"u","statusCheckRollup":{rollup}}}]"#
             );
             parse_pulls(&json).unwrap()[0].checks
         };
@@ -666,6 +640,13 @@ mod tests {
         assert_eq!(published("2000-03-01T00:00:00Z"), epoch(951_868_800));
         assert_eq!(published("yesterday"), None);
         assert_eq!(published("2024-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn parses_issues_without_author_or_labels() {
+        let json = r#"[{"number":7,"title":"t","url":"u"}]"#;
+        let issue = &parse_issues(json).unwrap()[0];
+        assert_eq!((issue.number, issue.title.as_str()), (7, "t"));
     }
 
     #[test]
