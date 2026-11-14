@@ -200,17 +200,13 @@ impl Render for RepoPanel {
                 .pulls
                 .iter()
                 .map(|p| {
-                    // A draft is muted instead of carrying a pill.
-                    let muted = if p.draft {
-                        Some(mocha::overlay0())
-                    } else {
-                        None
-                    };
+                    // A draft is greyed out instead of carrying a pill.
+                    let draft_colour = p.draft.then(mocha::overlay0);
                     link_row(theme, format!("pr-{}", p.number), &p.url)
-                        .child(number(muted.unwrap_or(theme.subtext), p.number))
+                        .child(number(draft_colour.unwrap_or(theme.subtext), p.number))
                         .child(
                             title(format!("pr-title-{}", p.number), &p.title)
-                                .when_some(muted, |t, colour| t.text_color(colour)),
+                                .when_some(draft_colour, |t, colour| t.text_color(colour)),
                         )
                         .child(checks_pill(theme, p.checks))
                         .into_any_element()
@@ -428,16 +424,15 @@ fn title(id: String, title: &str) -> gpui::Stateful<gpui::Div> {
         .flex_1()
         .min_w_0()
         .truncate()
-        .tooltip({
-            let full = full.clone();
-            move |window, cx| Tooltip::new(full.clone()).build(window, cx)
-        })
-        .child(full)
+        .child(full.clone())
+        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
 }
 
-/// A small rounded label.
+/// A small rounded label, kept at its natural width.
 fn pill(bg: Rgba, fg: Rgba, text: impl Into<SharedString>) -> impl IntoElement {
     div()
+        .flex_shrink_0()
+        .whitespace_nowrap()
         .px_1p5()
         .rounded_md()
         .text_xs()
