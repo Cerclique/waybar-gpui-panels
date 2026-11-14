@@ -1,6 +1,6 @@
 # Fetch GitHub data through the `gh` CLI, cached by the daemon
 
-The repo panel gets its data by running `gh … --json` commands (`gh issue list`, `gh pr list`, `gh run list`, `gh release view`, in parallel) rather than calling GitHub's API itself. `gh` already handles authentication, so the panel stores no tokens and adds no HTTP or TLS dependencies. The cost is a process spawn per command (roughly 200–400 ms each) and a runtime dependency on an installed, logged-in `gh`. The daemon keeps the last result per repository. An open shows the cached result immediately and refreshes it in the background, so the spawn cost is mostly hidden.
+The repo panel gets its data by running `gh … --json` commands (`gh issue list`, `gh pr list`, `gh release view` and `gh workflow list` in parallel, then one `gh run list` per workflow, also in parallel) rather than calling GitHub's API itself. `gh` already handles authentication, so the panel stores no tokens and adds no HTTP or TLS dependencies. The cost is a process spawn per command (roughly 200–400 ms each, and one per workflow for its runs) and a runtime dependency on an installed, logged-in `gh`. The daemon keeps the last result per repository. An open shows the cached result immediately and refreshes it in the background, so the spawn cost is mostly hidden.
 
 ## Considered Options
 

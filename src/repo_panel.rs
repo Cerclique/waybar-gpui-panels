@@ -1,6 +1,7 @@
 //! The `repo` panel: open issues, open pull requests and CI of one repository
 //! at a time, picked from a dropdown, with its latest release in the header.
 //! Read-only: a click on a row opens it in the browser and closes the popover.
+//! CI is a tree of workflows, each expanding to its recent runs.
 //!
 //! It shows the watch list (see [`watch_list`]), or its panel arguments,
 //! `owner/name …`, when given.
@@ -16,20 +17,20 @@ use std::{
 use crate::{
     cache::{Cache, Entry},
     mocha,
-    status::{CiState, LIST_LIMIT, Release, Repo},
+    status::{CiState, LIST_LIMIT, Release, Repo, Workflow},
     watch_list,
 };
 use waybar_gpui::{
     Panel, Theme, card, close,
     components::{
-        IconName, Sizable as _,
+        Icon, IconName, Sizable as _,
         button::{Button, ButtonVariants as _, DropdownButton},
         menu::PopupMenuItem,
         tab::{Tab, TabBar},
         tooltip::Tooltip,
     },
     gpui::{
-        self, AnyElement, App, ClickEvent, Context, FontWeight, Global, IntoElement, Rgba,
+        self, AnyElement, App, ClickEvent, Context, Entity, FontWeight, Global, IntoElement, Rgba,
         SharedString, Subscription, Task, Window, div, prelude::*, px,
     },
 };
@@ -50,12 +51,34 @@ impl View {
 struct LastRepo(Option<Repo>);
 impl Global for LastRepo {}
 
+/// The CI workflows expanded in the tree, by repository key and workflow id,
+/// kept across opens by the daemon. Collapsed unless listed.
+#[derive(Default)]
+struct ExpandedWorkflows(HashSet<(String, u64)>);
+impl Global for ExpandedWorkflows {}
+
+impl ExpandedWorkflows {
+    fn contains(&self, repo: &Repo, workflow: u64) -> bool {
+        self.0.contains(&(repo.key(), workflow))
+    }
+
+    fn toggle(&mut self, repo: &Repo, workflow: u64) {
+        let key = (repo.key(), workflow);
+        if !self.0.remove(&key) {
+            self.0.insert(key);
+        }
+    }
+}
+
 pub struct RepoPanel {
     repos: Result<Vec<Repo>, String>,
     selected: usize,
     view: View,
     /// Repositories refreshed during this open: each at most once.
     refreshed: HashSet<usize>,
+    /// Workflows showing all their runs, by repository index and workflow
+    /// id: only for this open.
+    all_runs: HashSet<(usize, u64)>,
     /// Redraws when a refresh lands in the cache.
     _cache_changed: Subscription,
     /// Redraws every second, to keep the data's age current.
@@ -84,6 +107,7 @@ impl Panel for RepoPanel {
             selected,
             view: View::Issues,
             refreshed: HashSet::new(),
+            all_runs: HashSet::new(),
             _cache_changed: cx.observe_global::<Cache>(|_, cx| cx.notify()),
             _tick,
         };
@@ -147,8 +171,16 @@ impl Render for RepoPanel {
             return card.child(header).child(muted(theme, message));
         };
         let entity = cx.entity();
-        let tab = |label: &'static str, count: String, view: View| {
-            let (bg, fg) = if view == self.view {
+        let failing = status
+            .workflows
+            .iter()
+            .filter(|w| w.last_build() == Some(CiState::Failure))
+            .count();
+        let tab = |label: &'static str, count: String, alert: bool, view: View| {
+            let red = mocha::red();
+            let (bg, fg) = if alert {
+                (Rgba { a: 0.18, ..red }, red)
+            } else if view == self.view {
                 (
                     Rgba {
                         a: 0.18,
@@ -171,19 +203,28 @@ impl Render for RepoPanel {
             .underline()
             .small()
             .selected_index(View::ALL.iter().position(|v| *v == self.view).unwrap_or(0))
-            .on_click(move |index, _, cx| {
-                entity.update(cx, |panel, cx| {
-                    panel.view = View::ALL[*index];
-                    cx.notify();
-                })
+            .on_click({
+                let entity = entity.clone();
+                move |index, _, cx| {
+                    entity.update(cx, |panel, cx| {
+                        panel.view = View::ALL[*index];
+                        cx.notify();
+                    })
+                }
             })
             .child(tab(
                 "Issues",
                 count_label(status.issues.len()),
+                false,
                 View::Issues,
             ))
-            .child(tab("PRs", count_label(status.pulls.len()), View::Pulls))
-            .child(tab("CI", status.runs.len().to_string(), View::Ci));
+            .child(tab(
+                "PRs",
+                count_label(status.pulls.len()),
+                false,
+                View::Pulls,
+            ))
+            .child(tab("CI", failing.to_string(), failing > 0, View::Ci));
 
         let rows: Vec<AnyElement> = match self.view {
             View::Issues => status
@@ -212,29 +253,25 @@ impl Render for RepoPanel {
                         .into_any_element()
                 })
                 .collect(),
-            View::Ci => status
-                .runs
-                .iter()
-                .enumerate()
-                .map(|(n, run)| {
-                    link_row(theme, format!("run-{n}"), &run.url)
-                        .child(
-                            div()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(run.workflow.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_color(theme.subtext)
-                                .child(run.branch.clone()),
-                        )
-                        .child(ci_pill(theme, run.state))
-                        .into_any_element()
-                })
-                .collect(),
+            View::Ci => {
+                let expanded = cx.try_global::<ExpandedWorkflows>();
+                let mut rows = Vec::new();
+                for workflow in &status.workflows {
+                    let open = expanded.is_some_and(|e| e.contains(repo, workflow.id));
+                    rows.push(workflow_row(theme, repo, workflow, open, &entity));
+                    if open {
+                        let all = self.all_runs.contains(&(self.selected, workflow.id));
+                        rows.extend(run_rows(theme, workflow, all, self.selected, &entity));
+                    }
+                }
+                rows
+            }
         };
-        let empty = rows.is_empty();
+        let empty = match self.view {
+            _ if !rows.is_empty() => None,
+            View::Issues | View::Pulls => Some("Nothing open"),
+            View::Ci => Some("No workflows"),
+        };
 
         card.child(header)
             .child(tabs)
@@ -247,7 +284,7 @@ impl Render for RepoPanel {
                     .overflow_y_scroll()
                     .children(rows),
             )
-            .when(empty, |c| c.child(muted(theme, "Nothing open")))
+            .when_some(empty, |c, message| c.child(muted(theme, message)))
     }
 }
 
@@ -261,12 +298,15 @@ fn age_label(age: Duration) -> String {
     }
 }
 
-/// How long ago a release was published, rounded down to its largest unit.
-fn release_age(age: Duration) -> String {
-    let hours = age.as_secs() / 3600;
+/// How long ago something happened, rounded down to its largest unit:
+/// `now`, `5m`, `3h`, `2d`, `1w`, `4mo`, `1y`.
+fn short_age(age: Duration) -> String {
+    let mins = age.as_secs() / 60;
+    let hours = mins / 60;
     let days = hours / 24;
     match days {
-        _ if hours == 0 => "now".to_owned(),
+        _ if mins == 0 => "now".to_owned(),
+        _ if hours == 0 => format!("{mins}m"),
         0 => format!("{hours}h"),
         1..7 => format!("{days}d"),
         7..28 => format!("{}w", days / 7),
@@ -274,6 +314,16 @@ fn release_age(age: Duration) -> String {
         _ => format!("{}y", (days / 365).max(1)),
     }
 }
+
+/// How many runs of a workflow with `len` of them are shown, and how many
+/// are left behind "Show more": the first [`SHOWN_RUNS`] until `all`.
+fn shown_runs(len: usize, all: bool) -> (usize, usize) {
+    let shown = if all { len } else { len.min(SHOWN_RUNS) };
+    (shown, len - shown)
+}
+
+/// How many runs an expanded workflow shows before "Show more".
+const SHOWN_RUNS: usize = 5;
 
 /// A list's length, as `30+` when it hit the fetch limit and may have more.
 fn count_label(len: usize) -> String {
@@ -383,7 +433,7 @@ fn release_badge(theme: Theme, release: &Release) -> impl IntoElement {
         .child(
             div()
                 .text_color(theme.subtext)
-                .child(format!("· {}", release_age(age))),
+                .child(format!("· {}", short_age(age))),
         )
 }
 
@@ -396,8 +446,8 @@ fn open_and_close(url: &str) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 's
     }
 }
 
-/// A row that opens `url` in the browser on click, then closes the popover.
-fn link_row(theme: Theme, id: String, url: &str) -> gpui::Stateful<gpui::Div> {
+/// A clickable row, highlighted on hover.
+fn row(theme: Theme, id: String) -> gpui::Stateful<gpui::Div> {
     div()
         .id(SharedString::from(id))
         .flex()
@@ -408,7 +458,109 @@ fn link_row(theme: Theme, id: String, url: &str) -> gpui::Stateful<gpui::Div> {
         .rounded_md()
         .cursor_pointer()
         .hover(|style| style.bg(theme.surface))
-        .on_click(open_and_close(url))
+}
+
+/// A row that opens `url` in the browser on click, then closes the popover.
+fn link_row(theme: Theme, id: String, url: &str) -> gpui::Stateful<gpui::Div> {
+    row(theme, id).on_click(open_and_close(url))
+}
+
+/// A workflow's line in the CI tree: a chevron, its name and the pill of its
+/// last meaningful build. A click expands or collapses it, remembered in
+/// [`ExpandedWorkflows`].
+fn workflow_row(
+    theme: Theme,
+    repo: &Repo,
+    workflow: &Workflow,
+    open: bool,
+    entity: &Entity<RepoPanel>,
+) -> AnyElement {
+    let (repo, id, entity) = (repo.clone(), workflow.id, entity.clone());
+    let chevron = if open {
+        IconName::ChevronDown
+    } else {
+        IconName::ChevronRight
+    };
+    let state = match workflow.last_build() {
+        Some(state) => ci_pill(theme, state).into_any_element(),
+        None => pill(theme.surface, mocha::overlay0(), "never run").into_any_element(),
+    };
+    row(theme, format!("workflow-{id}"))
+        .on_click(move |_, _, cx| {
+            cx.default_global::<ExpandedWorkflows>().toggle(&repo, id);
+            entity.update(cx, |_, cx| cx.notify());
+        })
+        .child(
+            Icon::new(chevron)
+                .xsmall()
+                .flex_shrink_0()
+                .text_color(theme.subtext),
+        )
+        .child(
+            title(format!("workflow-name-{id}"), &workflow.name).font_weight(FontWeight::SEMIBOLD),
+        )
+        .child(state)
+        .into_any_element()
+}
+
+/// An expanded workflow's runs, indented under its name: the first
+/// [`SHOWN_RUNS`], then a "Show N more" row, unless `all`.
+fn run_rows(
+    theme: Theme,
+    workflow: &Workflow,
+    all: bool,
+    selected: usize,
+    entity: &Entity<RepoPanel>,
+) -> Vec<AnyElement> {
+    let id = workflow.id;
+    if workflow.runs.is_empty() {
+        return vec![
+            div()
+                .pl_7()
+                .py_1()
+                .child(muted(theme, "No runs yet"))
+                .into_any_element(),
+        ];
+    }
+    let (shown, more) = shown_runs(workflow.runs.len(), all);
+    let now = SystemTime::now();
+    let mut rows: Vec<AnyElement> = workflow.runs[..shown]
+        .iter()
+        .enumerate()
+        .map(|(n, run)| {
+            let age = now.duration_since(run.created_at).unwrap_or_default();
+            link_row(theme, format!("run-{id}-{n}"), &run.url)
+                .pl_7()
+                .child(title(format!("run-branch-{id}-{n}"), &run.branch))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(theme.subtext)
+                        .child(short_age(age)),
+                )
+                .child(ci_pill(theme, run.state))
+                .into_any_element()
+        })
+        .collect();
+    if more > 0 {
+        let entity = entity.clone();
+        rows.push(
+            row(theme, format!("more-{id}"))
+                .pl_7()
+                .text_xs()
+                .text_color(theme.subtext)
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |panel, cx| {
+                        panel.all_runs.insert((selected, id));
+                        cx.notify();
+                    })
+                })
+                .child(format!("Show {more} more"))
+                .into_any_element(),
+        );
+    }
+    rows
 }
 
 fn number(colour: Rgba, number: u64) -> impl IntoElement {
@@ -481,12 +633,16 @@ mod tests {
     }
 
     #[test]
-    fn rounds_a_release_age_down_to_its_largest_unit() {
-        let mins = |m: u64| Duration::from_secs(m * 60);
+    fn rounds_an_age_down_to_its_largest_unit() {
+        let secs = Duration::from_secs;
+        let mins = |m: u64| secs(m * 60);
         let hours = |h: u64| mins(h * 60);
         let days = |d: u64| hours(d * 24);
         let cases = [
-            (mins(59), "now"),
+            (mins(0), "now"),
+            (secs(59), "now"),
+            (mins(1), "1m"),
+            (mins(59), "59m"),
             (hours(1), "1h"),
             (hours(23), "23h"),
             (hours(24), "1d"),
@@ -502,8 +658,32 @@ mod tests {
             (days(730), "2y"),
         ];
         for (age, shown) in cases {
-            assert_eq!(release_age(age), shown, "{age:?}");
+            assert_eq!(short_age(age), shown, "{age:?}");
         }
+    }
+
+    #[test]
+    fn remembers_expanded_workflows_per_repo() {
+        let repo = |s| Repo::parse(s).unwrap();
+        let mut expanded = ExpandedWorkflows::default();
+        assert!(!expanded.contains(&repo("a/b"), 7));
+        expanded.toggle(&repo("a/b"), 7);
+        assert!(expanded.contains(&repo("a/b"), 7));
+        assert!(expanded.contains(&repo("A/B"), 7));
+        assert!(!expanded.contains(&repo("a/b"), 8));
+        assert!(!expanded.contains(&repo("c/d"), 7));
+        expanded.toggle(&repo("A/b"), 7);
+        assert!(!expanded.contains(&repo("a/b"), 7));
+    }
+
+    #[test]
+    fn shows_five_runs_then_offers_the_rest() {
+        assert_eq!(shown_runs(20, false), (5, 15));
+        assert_eq!(shown_runs(6, false), (5, 1));
+        assert_eq!(shown_runs(5, false), (5, 0));
+        assert_eq!(shown_runs(3, false), (3, 0));
+        assert_eq!(shown_runs(0, false), (0, 0));
+        assert_eq!(shown_runs(20, true), (20, 0));
     }
 
     #[test]

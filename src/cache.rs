@@ -32,24 +32,18 @@ pub struct Entry {
     pub error: Option<GhError>,
     /// Whether a refresh is running.
     pub refreshing: bool,
-    /// Fetched once, by the first refresh that succeeds in getting it.
-    default_branch: Option<String>,
-}
-
-fn key(repo: &Repo) -> String {
-    repo.to_string().to_lowercase()
 }
 
 impl Cache {
     /// `repo`'s entry, if it was ever refreshed.
     pub fn get<'a>(repo: &Repo, cx: &'a App) -> Option<&'a Entry> {
-        cx.try_global::<Self>()?.entries.get(&key(repo))
+        cx.try_global::<Self>()?.entries.get(&repo.key())
     }
 
     /// Starts refreshing `repo` in the background, unless a refresh of it is
     /// already running: that one is reused.
     pub fn refresh(repo: &Repo, cx: &mut App) {
-        let key = key(repo);
+        let key = repo.key();
         let entry = cx
             .default_global::<Self>()
             .entries
@@ -59,20 +53,18 @@ impl Cache {
             return;
         }
         entry.refreshing = true;
-        let branch = entry.default_branch.clone();
         let repo = repo.clone();
         cx.spawn(async move |cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { status::load(&repo, branch) })
+                .spawn(async move { status::load(&repo) })
                 .await;
             cx.update_global::<Self, _>(|cache, _| {
                 let entry = cache.entries.entry(key).or_default();
                 entry.refreshing = false;
                 match result {
-                    Ok(loaded) => {
-                        entry.default_branch = Some(loaded.default_branch);
-                        entry.status = Some((loaded.status, Instant::now()));
+                    Ok(status) => {
+                        entry.status = Some((status, Instant::now()));
                         entry.error = None;
                     }
                     Err(e) => entry.error = Some(e),
