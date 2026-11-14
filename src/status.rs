@@ -1,12 +1,11 @@
-//! A repository's status: open issues, open pull requests, recent CI runs and
-//! the latest release.
+//! A repository's status: open issues, open pull requests, its workflows with
+//! their recent runs, and the latest release.
 //!
 //! [`load`] is the seam for the data source: it runs `gh … --json` commands
 //! (see `docs/adr/0001-fetch-github-data-through-gh-cli.md`) and parses their
 //! output. It blocks, so it runs on a background thread.
 
 use std::{
-    collections::HashSet,
     fmt, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +49,12 @@ impl Repo {
     pub fn is_same(&self, other: &Self) -> bool {
         self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
     }
+
+    /// Lowercase `owner/name`: the same for every spelling of the repository,
+    /// to key what's kept per repository.
+    pub fn key(&self) -> String {
+        self.to_string().to_lowercase()
+    }
 }
 
 /// A non-empty owner or repository name, in the characters GitHub allows.
@@ -69,7 +74,8 @@ impl fmt::Display for Repo {
 pub struct RepoStatus {
     pub issues: Vec<Issue>,
     pub pulls: Vec<PullRequest>,
-    pub runs: Vec<WorkflowRun>,
+    /// Every active workflow, failing first (see [`order_workflows`]).
+    pub workflows: Vec<Workflow>,
     /// `None` when the repository has no published release.
     pub release: Option<Release>,
 }
@@ -98,11 +104,33 @@ pub struct PullRequest {
     pub url: String,
 }
 
+/// An active GitHub Actions workflow and its recent runs on every branch,
+/// newest first.
+#[derive(Debug, Clone)]
+pub struct Workflow {
+    pub id: u64,
+    pub name: String,
+    pub runs: Vec<WorkflowRun>,
+}
+
+impl Workflow {
+    /// The state of its last meaningful build: its newest run that isn't
+    /// neutral, else its newest run. `None` when it has never run.
+    pub fn last_build(&self) -> Option<CiState> {
+        self.runs
+            .iter()
+            .map(|r| r.state)
+            .find(|s| !matches!(s, CiState::Neutral(_)))
+            .or_else(|| self.runs.first().map(|r| r.state))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkflowRun {
-    pub workflow: String,
     pub branch: String,
     pub state: CiState,
+    /// When the run was triggered.
+    pub created_at: SystemTime,
     pub url: String,
 }
 
@@ -184,50 +212,21 @@ pub const LIST_LIMIT: usize = 30;
 /// How long one `gh` command may run.
 const GH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How many recent runs on the default branch are scanned for the latest
-/// run of each workflow.
-const RUN_LIMIT: usize = 100;
+/// How many recent runs of each workflow are fetched, across all branches.
+const RUN_LIMIT: usize = 20;
 
-/// What [`load`] fetched.
-pub struct Loaded {
-    /// The default branch, to pass back to the next [`load`].
-    pub default_branch: String,
-    pub status: RepoStatus,
-}
-
-/// Fetches `repo`'s status: its open issues, open pull requests, the latest
-/// CI run of each workflow on its default branch and its latest release.
-/// Looks the default branch up first unless `default_branch` already gives it.
+/// Fetches `repo`'s status: its open issues, open pull requests, every active
+/// workflow with its last [`RUN_LIMIT`] runs, and its latest release.
+///
+/// The issue, pull request and release lookups run in parallel with the
+/// workflow list, then each workflow's run list. Fails as a whole if any one
+/// of them fails, so fresh and stale data never mix; a repository without a
+/// release isn't a failure.
 ///
 /// Blocking; call it off the foreground thread.
-pub fn load(repo: &Repo, default_branch: Option<String>) -> Result<Loaded, GhError> {
-    let default_branch = match default_branch {
-        Some(branch) => branch,
-        None => fetch_default_branch(repo)?,
-    };
-    let status = fetch_status(repo, &default_branch)?;
-    Ok(Loaded {
-        default_branch,
-        status,
-    })
-}
-
-fn fetch_default_branch(repo: &Repo) -> Result<String, GhError> {
-    let repo = repo.to_string();
-    let json = run_gh(
-        &["repo", "view", &repo, "--json", "defaultBranchRef"],
-        GH_TIMEOUT,
-    )?;
-    parse_default_branch(&json).map_err(unexpected_output)
-}
-
-/// Runs the three list commands and the release lookup in parallel. Fails as
-/// a whole if any one of them fails, so fresh and stale data never mix; a
-/// repository without a release isn't a failure.
-fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
+pub fn load(repo: &Repo) -> Result<RepoStatus, GhError> {
     let repo = repo.to_string();
     let limit = LIST_LIMIT.to_string();
-    let run_limit = RUN_LIMIT.to_string();
     let list = |kind: &'static str, fields: &'static str| {
         let (repo, limit) = (&repo, &limit);
         move || {
@@ -248,26 +247,9 @@ fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
             )
         }
     };
-    let (issues, pulls, runs, release) = thread::scope(|s| {
+    let (issues, pulls, workflows, release) = thread::scope(|s| {
         let issues = s.spawn(list("issue", "number,title,url"));
         let pulls = s.spawn(list("pr", "number,title,isDraft,url,statusCheckRollup"));
-        let runs = s.spawn(|| {
-            run_gh(
-                &[
-                    "run",
-                    "list",
-                    "--repo",
-                    &repo,
-                    "--branch",
-                    branch,
-                    "--limit",
-                    &run_limit,
-                    "--json",
-                    "workflowDatabaseId,workflowName,headBranch,status,conclusion,url",
-                ],
-                GH_TIMEOUT,
-            )
-        });
         let release = s.spawn(|| {
             run_gh(
                 &[
@@ -281,19 +263,85 @@ fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
                 GH_TIMEOUT,
             )
         });
-        (join(issues), join(pulls), join(runs), join(release))
+        // On this thread, while the others run: the run lists need the
+        // workflow list first.
+        let workflows = fetch_workflows(s, &repo);
+        (join(issues), join(pulls), workflows, join(release))
     });
     let release = match release {
         Ok(json) => Some(parse_release(&json).map_err(unexpected_output)?),
         Err(GhError::ReleaseNotFound) => None,
         Err(e) => return Err(e),
     };
+    let mut workflows = workflows?;
+    order_workflows(&mut workflows);
     Ok(RepoStatus {
         issues: parse_issues(&issues?).map_err(unexpected_output)?,
         pulls: parse_pulls(&pulls?).map_err(unexpected_output)?,
-        runs: latest_runs(&runs?).map_err(unexpected_output)?,
+        workflows,
         release,
     })
+}
+
+/// Lists `repo`'s active workflows, then fetches each one's runs in parallel
+/// on `scope`.
+fn fetch_workflows<'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    repo: &'scope str,
+) -> Result<Vec<Workflow>, GhError> {
+    let json = run_gh(
+        &[
+            "workflow",
+            "list",
+            "--repo",
+            repo,
+            "--json",
+            "id,name,state",
+        ],
+        GH_TIMEOUT,
+    )?;
+    let mut workflows = parse_workflows(&json).map_err(unexpected_output)?;
+    let handles: Vec<_> = workflows
+        .iter()
+        .map(|w| {
+            let id = w.id.to_string();
+            scope.spawn(move || {
+                run_gh(
+                    &[
+                        "run",
+                        "list",
+                        "--repo",
+                        repo,
+                        "--workflow",
+                        &id,
+                        "--limit",
+                        &RUN_LIMIT.to_string(),
+                        "--json",
+                        "headBranch,status,conclusion,createdAt,url",
+                    ],
+                    GH_TIMEOUT,
+                )
+            })
+        })
+        .collect();
+    // Join every handle before failing, so no thread outlives an error.
+    let runs: Vec<_> = handles.into_iter().map(join).collect();
+    for (workflow, json) in workflows.iter_mut().zip(runs) {
+        workflow.runs = parse_workflow_runs(&json?).map_err(unexpected_output)?;
+    }
+    Ok(workflows)
+}
+
+/// Puts failing workflows first, then running, then passing or neutral, then
+/// those never run; alphabetically by name, ignoring case, within each group.
+pub fn order_workflows(workflows: &mut [Workflow]) {
+    let group = |w: &Workflow| match w.last_build() {
+        Some(CiState::Failure) => 0,
+        Some(CiState::Running) => 1,
+        Some(CiState::Success | CiState::Neutral(_)) => 2,
+        None => 3,
+    };
+    workflows.sort_by_cached_key(|w| (group(w), w.name.to_lowercase()));
 }
 
 fn join(handle: thread::ScopedJoinHandle<'_, Result<String, GhError>>) -> Result<String, GhError> {
@@ -387,30 +435,48 @@ pub fn parse_pulls(json: &str) -> serde_json::Result<Vec<PullRequest>> {
         .collect())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhRun {
-    workflow_database_id: u64,
-    workflow_name: String,
-    head_branch: String,
-    status: String,
-    conclusion: Option<String>,
-    url: String,
+/// Parses `gh run list --json headBranch,status,conclusion,createdAt,url`,
+/// keeping its order (newest first).
+pub fn parse_workflow_runs(json: &str) -> serde_json::Result<Vec<WorkflowRun>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GhRun {
+        head_branch: String,
+        status: String,
+        conclusion: Option<String>,
+        created_at: String,
+        url: String,
+    }
+    let runs: Vec<GhRun> = serde_json::from_str(json)?;
+    runs.into_iter()
+        .map(|r| {
+            Ok(WorkflowRun {
+                state: run_state(&r.status, r.conclusion.as_deref().unwrap_or_default()),
+                created_at: parse_timestamp(&r.created_at)?,
+                branch: r.head_branch,
+                url: r.url,
+            })
+        })
+        .collect()
 }
 
-/// Parses `gh run list --json workflowDatabaseId,workflowName,headBranch,status,conclusion,url`
-/// (newest first) and keeps the latest run of each workflow.
-pub fn latest_runs(json: &str) -> serde_json::Result<Vec<WorkflowRun>> {
-    let runs: Vec<GhRun> = serde_json::from_str(json)?;
-    let mut seen = HashSet::new();
-    Ok(runs
+/// Parses `gh workflow list --json id,name,state`, keeping active workflows
+/// only. Their runs are fetched separately: they start empty.
+pub fn parse_workflows(json: &str) -> serde_json::Result<Vec<Workflow>> {
+    #[derive(Deserialize)]
+    struct GhWorkflow {
+        id: u64,
+        name: String,
+        state: String,
+    }
+    let workflows: Vec<GhWorkflow> = serde_json::from_str(json)?;
+    Ok(workflows
         .into_iter()
-        .filter(|r| seen.insert(r.workflow_database_id))
-        .map(|r| WorkflowRun {
-            state: run_state(&r.status, r.conclusion.as_deref().unwrap_or_default()),
-            workflow: r.workflow_name,
-            branch: r.head_branch,
-            url: r.url,
+        .filter(|w| w.state == "active")
+        .map(|w| Workflow {
+            id: w.id,
+            name: w.name,
+            runs: Vec::new(),
         })
         .collect())
 }
@@ -425,17 +491,17 @@ pub fn parse_release(json: &str) -> serde_json::Result<Release> {
         url: String,
     }
     let release: GhRelease = serde_json::from_str(json)?;
-    let published_at = parse_utc(&release.published_at).ok_or_else(|| {
-        serde::de::Error::custom(format!(
-            "expected a UTC timestamp, got {:?}",
-            release.published_at
-        ))
-    })?;
     Ok(Release {
+        published_at: parse_timestamp(&release.published_at)?,
         tag: release.tag_name,
-        published_at,
         url: release.url,
     })
+}
+
+/// [`parse_utc`], as a parse error when `s` isn't a UTC timestamp.
+fn parse_timestamp(s: &str) -> serde_json::Result<SystemTime> {
+    parse_utc(s)
+        .ok_or_else(|| serde::de::Error::custom(format!("expected a UTC timestamp, got {s:?}")))
 }
 
 /// Parses a UTC timestamp as GitHub prints it: `2024-02-29T23:59:59Z`.
@@ -461,21 +527,6 @@ fn days_since_epoch(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
-}
-
-/// Parses `gh repo view --json defaultBranchRef`.
-pub fn parse_default_branch(json: &str) -> serde_json::Result<String> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct GhRepo {
-        default_branch_ref: GhRef,
-    }
-    #[derive(Deserialize)]
-    struct GhRef {
-        name: String,
-    }
-    let repo: GhRepo = serde_json::from_str(json)?;
-    Ok(repo.default_branch_ref.name)
 }
 
 #[cfg(test)]
@@ -619,38 +670,121 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_latest_run_of_each_workflow() {
-        let runs = latest_runs(include_str!("fixtures/runs.json")).unwrap();
-        let summary: Vec<_> = runs
-            .iter()
-            .map(|r| (r.workflow.as_str(), r.state))
-            .collect();
+    fn parses_workflows_from_gh_workflow_list() {
+        let workflows = parse_workflows(include_str!("fixtures/workflows.json")).unwrap();
+        assert_eq!(workflows.len(), 22);
+        let first = &workflows[0];
         assert_eq!(
-            summary,
-            [
-                ("Copilot", CiState::Running),
-                ("Dependabot PR Triage Scheduler", CiState::Success),
-                ("Issue Triaging", CiState::Success),
-                ("Issue Triage (skills-driven)", CiState::Failure),
-                ("Triage Scheduled Tasks", CiState::Success),
-                ("PR Triaging", CiState::Success),
-                ("Bump Go", CiState::Success),
-                ("Agentic Maintenance", CiState::Success),
-                ("Go Vulnerability Check", CiState::Success),
-            ]
+            (first.id, first.name.as_str()),
+            (354_871_894, "Acceptance Tests")
         );
-        assert_eq!(runs[0].branch, "trunk");
-        assert_eq!(
-            runs[0].url,
-            "https://github.com/cli/cli/actions/runs/43613944310"
+        assert!(first.runs.is_empty());
+        assert!(
+            workflows
+                .iter()
+                .any(|w| w.id == 54_774_190 && w.name == "Deployment")
         );
     }
 
     #[test]
-    fn reads_the_default_branch() {
+    fn leaves_out_workflows_that_are_not_active() {
+        let json = r#"[{"id":1,"name":"On","state":"active"},{"id":2,"name":"Off","state":"disabled_manually"}]"#;
+        let names: Vec<_> = parse_workflows(json)
+            .unwrap()
+            .into_iter()
+            .map(|w| w.name)
+            .collect();
+        assert_eq!(names, ["On"]);
+    }
+
+    #[test]
+    fn parses_runs_from_gh_run_list() {
+        let runs = parse_workflow_runs(include_str!("fixtures/workflow_runs.json")).unwrap();
+        assert_eq!(runs.len(), 20);
+        let first = &runs[0];
+        assert_eq!(first.branch, "trunk");
+        assert_eq!(first.state, CiState::Success);
         assert_eq!(
-            parse_default_branch(include_str!("fixtures/repo.json")).unwrap(),
-            "trunk"
+            first.created_at,
+            UNIX_EPOCH + Duration::from_secs(1_794_509_313)
+        );
+        assert_eq!(
+            first.url,
+            "https://github.com/cli/cli/actions/runs/43283669119"
+        );
+        assert_eq!(runs[9].state, CiState::Neutral(NeutralKind::Cancelled));
+        assert_eq!(
+            (runs[18].branch.as_str(), runs[18].state),
+            ("niik/deploy", CiState::Failure)
+        );
+    }
+
+    fn workflow(name: &str, states: &[CiState]) -> Workflow {
+        Workflow {
+            id: 0,
+            name: name.to_owned(),
+            runs: states
+                .iter()
+                .map(|&state| WorkflowRun {
+                    branch: "main".to_owned(),
+                    state,
+                    created_at: UNIX_EPOCH,
+                    url: "u".to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_workflow_shows_its_last_build_that_is_not_neutral() {
+        let cancelled = CiState::Neutral(NeutralKind::Cancelled);
+        let skipped = CiState::Neutral(NeutralKind::Skipped);
+        let last = |states: &[CiState]| workflow("w", states).last_build();
+        assert_eq!(
+            last(&[CiState::Failure, CiState::Success]),
+            Some(CiState::Failure)
+        );
+        assert_eq!(
+            last(&[cancelled, skipped, CiState::Success]),
+            Some(CiState::Success)
+        );
+        assert_eq!(
+            last(&[CiState::Running, CiState::Failure]),
+            Some(CiState::Running)
+        );
+        assert_eq!(last(&[skipped, cancelled]), Some(skipped));
+        assert_eq!(last(&[]), None);
+    }
+
+    #[test]
+    fn orders_workflows_failing_running_passing_then_never_run() {
+        let skipped = CiState::Neutral(NeutralKind::Skipped);
+        let mut workflows = [
+            workflow("Release", &[]),
+            workflow("lint", &[CiState::Success]),
+            workflow("Deploy", &[skipped]),
+            workflow("e2e", &[CiState::Running]),
+            workflow("Build", &[CiState::Success]),
+            workflow("Tests", &[CiState::Failure]),
+            workflow("Bench", &[]),
+            workflow("audit", &[skipped, CiState::Failure]),
+        ];
+        order_workflows(&mut workflows);
+        let names: Vec<_> = workflows.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "audit", "Tests", "e2e", "Build", "Deploy", "lint", "Bench", "Release"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_in_progress_is_running() {
+        let json = r#"[{"headBranch":"b","status":"in_progress","conclusion":"","createdAt":"2026-01-01T00:00:00Z","url":"u"}]"#;
+        assert_eq!(
+            parse_workflow_runs(json).unwrap()[0].state,
+            CiState::Running
         );
     }
 
