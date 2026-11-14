@@ -18,18 +18,41 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// Parses `owner/name`; both parts must be non-empty.
+    /// Parses `owner/name`, `https://github.com/owner/name` (optionally
+    /// ending in `/` or `.git`) or `git@github.com:owner/name[.git]`, keeping
+    /// the spelling given. Any other host or a deeper URL is an error.
     pub fn parse(s: &str) -> Result<Self, String> {
-        match s.split_once('/') {
-            Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => {
-                Ok(Self {
-                    owner: owner.to_owned(),
-                    name: name.to_owned(),
-                })
-            }
-            _ => Err(format!("expected owner/repo, got {s:?}")),
+        let path = if let Some(rest) = s.strip_prefix("https://github.com/") {
+            let rest = rest.strip_suffix('/').unwrap_or(rest);
+            rest.strip_suffix(".git").unwrap_or(rest)
+        } else if let Some(rest) = s.strip_prefix("git@github.com:") {
+            rest.strip_suffix(".git").unwrap_or(rest)
+        } else {
+            s
+        };
+        match path.split_once('/') {
+            Some((owner, name)) if is_name(owner) && is_name(name) => Ok(Self {
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+            }),
+            _ => Err(format!(
+                "expected owner/name or a github.com URL, got {s:?}"
+            )),
         }
     }
+
+    /// Whether `self` and `other` are the same repository: GitHub names are
+    /// case-insensitive.
+    pub fn is_same(&self, other: &Self) -> bool {
+        self.owner.eq_ignore_ascii_case(&other.owner) && self.name.eq_ignore_ascii_case(&other.name)
+    }
+}
+
+/// A non-empty owner or repository name, in the characters GitHub allows.
+fn is_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 impl fmt::Display for Repo {
@@ -385,10 +408,49 @@ mod tests {
     }
 
     #[test]
+    fn parses_github_urls_to_owner_slash_name() {
+        for s in [
+            "Cerclique/waybar-gpui",
+            "https://github.com/Cerclique/waybar-gpui",
+            "https://github.com/Cerclique/waybar-gpui/",
+            "https://github.com/Cerclique/waybar-gpui.git",
+            "git@github.com:Cerclique/waybar-gpui.git",
+            "git@github.com:Cerclique/waybar-gpui",
+        ] {
+            let repo = Repo::parse(s).unwrap_or_else(|e| panic!("{s:?}: {e}"));
+            assert_eq!(repo.to_string(), "Cerclique/waybar-gpui", "{s:?}");
+        }
+    }
+
+    #[test]
     fn rejects_malformed_repos() {
-        for s in ["", "waybar-gpui", "/name", "owner/", "a/b/c"] {
+        for s in [
+            "",
+            "waybar-gpui",
+            "/name",
+            "owner/",
+            "a/b/c",
+            "a/b c",
+            "https://github.com/owner",
+            "https://github.com/owner/name/pulls",
+            "https://github.com/owner/name/tree/main",
+            "https://github.com/owner/name/issues/12",
+            "http://github.com/owner/name",
+            "https://www.github.com/owner/name",
+            "https://gitlab.com/owner/name",
+            "https://github.example.com/owner/name",
+            "git@gitlab.com:owner/name.git",
+        ] {
             assert!(Repo::parse(s).is_err(), "{s:?}");
         }
+    }
+
+    #[test]
+    fn says_what_forms_are_expected() {
+        assert_eq!(
+            Repo::parse("Cerclique").unwrap_err(),
+            r#"expected owner/name or a github.com URL, got "Cerclique""#
+        );
     }
 
     #[test]

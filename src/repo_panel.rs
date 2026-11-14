@@ -2,17 +2,19 @@
 //! at a time, picked from a dropdown. Read-only: a click on a row opens it in
 //! the browser and closes the popover.
 //!
-//! Its panel arguments are the repositories, `owner/name …`.
+//! It shows the watch list (see [`watch_list`]), or its panel arguments,
+//! `owner/name …`, when given.
 //!
 //! Data comes from the daemon's [`Cache`]: an open shows the cached status at
 //! once and refreshes it in the background.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, env, time::Duration};
 
 use crate::{
     cache::{Cache, Entry},
     mocha,
     status::{CiState, LIST_LIMIT, Repo},
+    watch_list,
 };
 use waybar_gpui::{
     Panel, Theme, card, close,
@@ -41,7 +43,7 @@ impl View {
 
 /// The last repository picked, kept across opens by the daemon.
 #[derive(Default)]
-struct LastRepo(Option<String>);
+struct LastRepo(Option<Repo>);
 impl Global for LastRepo {}
 
 pub struct RepoPanel {
@@ -60,9 +62,13 @@ impl Panel for RepoPanel {
     const NAME: &'static str = "repo";
 
     fn new(args: &[String], _: &mut Window, cx: &mut Context<Self>) -> Self {
-        let repos = parse_repos(args);
+        let path = watch_list::path(
+            env::var_os("XDG_CONFIG_HOME").as_deref(),
+            env::home_dir().as_deref(),
+        );
+        let repos = watch_list::load(args, path.as_deref());
         let selected = match &repos {
-            Ok(repos) => initial_index(repos, cx.default_global::<LastRepo>().0.as_deref()),
+            Ok(repos) => initial_index(repos, cx.default_global::<LastRepo>().0.as_ref()),
             Err(_) => 0,
         };
         let _tick = cx.spawn(async move |this, cx| {
@@ -93,24 +99,16 @@ impl RepoPanel {
             return;
         };
         self.selected = index;
-        cx.global_mut::<LastRepo>().0 = Some(repo.to_string());
+        cx.global_mut::<LastRepo>().0 = Some(repo.clone());
         if self.refreshed.insert(index) {
             Cache::refresh(repo, cx);
         }
     }
 }
 
-/// Every argument is an `owner/name`; at least one is needed.
-fn parse_repos(args: &[String]) -> Result<Vec<Repo>, String> {
-    if args.is_empty() {
-        return Err("usage: repo <owner/name>…".to_owned());
-    }
-    args.iter().map(|a| Repo::parse(a)).collect()
-}
-
 /// The last picked repository if it's among `repos`, else the first.
-fn initial_index(repos: &[Repo], last: Option<&str>) -> usize {
-    last.and_then(|last| repos.iter().position(|r| r.to_string() == last))
+fn initial_index(repos: &[Repo], last: Option<&Repo>) -> usize {
+    last.and_then(|last| repos.iter().position(|r| r.is_same(last)))
         .unwrap_or(0)
 }
 
@@ -359,17 +357,6 @@ fn muted(theme: Theme, text: impl Into<SharedString>) -> impl IntoElement {
 mod tests {
     use super::*;
 
-    fn args(words: &[&str]) -> Vec<String> {
-        words.iter().map(|w| (*w).to_owned()).collect()
-    }
-
-    #[test]
-    fn needs_at_least_one_valid_repo() {
-        assert!(parse_repos(&[]).is_err());
-        assert!(parse_repos(&args(&["a/b", "nope"])).is_err());
-        assert_eq!(parse_repos(&args(&["a/b", "c/d"])).unwrap().len(), 2);
-    }
-
     #[test]
     fn says_how_old_the_data_is() {
         let secs = Duration::from_secs;
@@ -390,9 +377,11 @@ mod tests {
 
     #[test]
     fn reopens_on_the_last_picked_repo() {
-        let repos = parse_repos(&args(&["a/b", "c/d"])).unwrap();
+        let repo = |s| Repo::parse(s).unwrap();
+        let repos = [repo("a/b"), repo("c/d")];
         assert_eq!(initial_index(&repos, None), 0);
-        assert_eq!(initial_index(&repos, Some("c/d")), 1);
-        assert_eq!(initial_index(&repos, Some("gone/away")), 0);
+        assert_eq!(initial_index(&repos, Some(&repo("c/d"))), 1);
+        assert_eq!(initial_index(&repos, Some(&repo("gone/away"))), 0);
+        assert_eq!(initial_index(&repos, Some(&repo("C/D"))), 1);
     }
 }
