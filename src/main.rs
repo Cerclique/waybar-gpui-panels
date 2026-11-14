@@ -2,6 +2,8 @@
 //!
 //! On-click: `waybar-github-viewer toggle repo <owner/name>…`.
 
+mod cache;
+mod gh;
 mod mocha;
 mod repo_panel;
 mod status;

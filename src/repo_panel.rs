@@ -3,12 +3,16 @@
 //! the browser and closes the popover.
 //!
 //! Its panel arguments are the repositories, `owner/name …`.
+//!
+//! Data comes from the daemon's [`Cache`]: an open shows the cached status at
+//! once and refreshes it in the background.
 
-use std::collections::HashMap;
+use std::{collections::HashSet, time::Duration};
 
 use crate::{
+    cache::{Cache, Entry},
     mocha,
-    status::{self, CiState, Repo, RepoStatus},
+    status::{CiState, LIST_LIMIT, Repo},
 };
 use waybar_gpui::{
     Panel, Theme, card, close,
@@ -19,8 +23,8 @@ use waybar_gpui::{
         tab::{Tab, TabBar},
     },
     gpui::{
-        self, AnyElement, App, Context, FontWeight, Global, IntoElement, Rgba, SharedString, Task,
-        Window, div, prelude::*, px,
+        self, AnyElement, App, Context, FontWeight, Global, IntoElement, Rgba, SharedString,
+        Subscription, Task, Window, div, prelude::*, px,
     },
 };
 
@@ -35,12 +39,6 @@ impl View {
     const ALL: [Self; 3] = [Self::Issues, Self::Pulls, Self::Ci];
 }
 
-enum Load {
-    Loading,
-    Loaded(RepoStatus),
-    Failed(String),
-}
-
 /// The last repository picked, kept across opens by the daemon.
 #[derive(Default)]
 struct LastRepo(Option<String>);
@@ -50,10 +48,12 @@ pub struct RepoPanel {
     repos: Result<Vec<Repo>, String>,
     selected: usize,
     view: View,
-    /// Per repository, loaded on first selection during this open.
-    loads: HashMap<usize, Load>,
-    /// Dropped with the panel on close, which abandons the fetches.
-    fetches: Vec<Task<()>>,
+    /// Repositories refreshed during this open: each at most once.
+    refreshed: HashSet<usize>,
+    /// Redraws when a refresh lands in the cache.
+    _cache_changed: Subscription,
+    /// Redraws every second, to keep the data's age current.
+    _tick: Task<()>,
 }
 
 impl Panel for RepoPanel {
@@ -65,12 +65,21 @@ impl Panel for RepoPanel {
             Ok(repos) => initial_index(repos, cx.default_global::<LastRepo>().0.as_deref()),
             Err(_) => 0,
         };
+        let _tick = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return; // the popover closed
+                }
+            }
+        });
         let mut panel = Self {
             repos,
             selected,
             view: View::Issues,
-            loads: HashMap::new(),
-            fetches: Vec::new(),
+            refreshed: HashSet::new(),
+            _cache_changed: cx.observe_global::<Cache>(|_, cx| cx.notify()),
+            _tick,
         };
         panel.select(selected, cx);
         panel
@@ -78,32 +87,16 @@ impl Panel for RepoPanel {
 }
 
 impl RepoPanel {
-    /// Shows repository `index`, fetching it if this open hasn't yet.
+    /// Shows repository `index`, refreshing it if this open hasn't yet.
     fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(repo) = self.repos.as_ref().ok().and_then(|r| r.get(index)).cloned() else {
+        let Some(repo) = self.repos.as_ref().ok().and_then(|r| r.get(index)) else {
             return;
         };
         self.selected = index;
         cx.global_mut::<LastRepo>().0 = Some(repo.to_string());
-        if self.loads.contains_key(&index) {
-            return;
+        if self.refreshed.insert(index) {
+            Cache::refresh(repo, cx);
         }
-        self.loads.insert(index, Load::Loading);
-        self.fetches.push(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { status::load(&repo) })
-                .await;
-            // An error here means the popover closed first: nothing to do.
-            let _ = this.update(cx, |panel, cx| {
-                let load = match result {
-                    Ok(status) => Load::Loaded(status),
-                    Err(e) => Load::Failed(e),
-                };
-                panel.loads.insert(index, load);
-                cx.notify();
-            });
-        }));
     }
 }
 
@@ -130,14 +123,18 @@ impl Render for RepoPanel {
             Err(e) => return card.child(muted(theme, e.clone())),
         };
         let header = header(repos, self.selected, cx);
-        let status = match self.loads.get(&self.selected) {
-            Some(Load::Loaded(status)) => status,
-            Some(Load::Failed(e)) => return card.child(header).child(muted(theme, e.clone())),
-            Some(Load::Loading) | None => {
-                return card.child(header).child(muted(theme, "Loading…"));
-            }
+        let Some(entry) = Cache::get(&repos[self.selected], cx) else {
+            return card.child(header).child(muted(theme, "Loading…"));
         };
-
+        let header = header.child(freshness(theme, entry));
+        let Some((status, _)) = &entry.status else {
+            // Nothing cached: the error, if any, fills the panel.
+            let message = match &entry.error {
+                Some(e) => e.to_string(),
+                None => "Loading…".to_owned(),
+            };
+            return card.child(header).child(muted(theme, message));
+        };
         let entity = cx.entity();
         let tabs = TabBar::new("views")
             .underline()
@@ -149,8 +146,8 @@ impl Render for RepoPanel {
                     cx.notify();
                 })
             })
-            .child(Tab::new().label(format!("Issues {}", status.issues.len())))
-            .child(Tab::new().label(format!("PRs {}", status.pulls.len())))
+            .child(Tab::new().label(format!("Issues {}", count_label(status.issues.len()))))
+            .child(Tab::new().label(format!("PRs {}", count_label(status.pulls.len()))))
             .child(Tab::new().label(format!("CI {}", status.runs.len())));
 
         let rows: Vec<AnyElement> = match self.view {
@@ -222,6 +219,43 @@ impl Render for RepoPanel {
             )
             .when(empty, |c| c.child(muted(theme, "Nothing open")))
     }
+}
+
+/// How old the shown data is.
+fn age_label(age: Duration) -> String {
+    let secs = age.as_secs();
+    match secs {
+        0..60 => format!("updated {secs}s ago"),
+        60..3600 => format!("updated {}m ago", secs / 60),
+        _ => format!("updated {}h ago", secs / 3600),
+    }
+}
+
+/// A list's length, as `30+` when it hit the fetch limit and may have more.
+fn count_label(len: usize) -> String {
+    if len >= LIST_LIMIT {
+        format!("{LIST_LIMIT}+")
+    } else {
+        len.to_string()
+    }
+}
+
+/// The header's note on the shown data: its age, "updating…" while a refresh
+/// runs, and the last refresh's error while cached data stays on screen.
+fn freshness(theme: Theme, entry: &Entry) -> impl IntoElement {
+    let cached = entry.status.as_ref();
+    div()
+        .flex()
+        .flex_1()
+        .justify_end()
+        .gap_2()
+        .text_xs()
+        .text_color(theme.subtext)
+        .when_some(cached, |d, (_, at)| d.child(age_label(at.elapsed())))
+        .when(entry.refreshing, |d| d.child("updating…"))
+        .when_some(entry.error.as_ref().filter(|_| cached.is_some()), |d, e| {
+            d.child(div().text_color(mocha::red()).child(e.to_string()))
+        })
 }
 
 /// The repository picker, then whatever the caller adds on the right.
@@ -334,6 +368,24 @@ mod tests {
         assert!(parse_repos(&[]).is_err());
         assert!(parse_repos(&args(&["a/b", "nope"])).is_err());
         assert_eq!(parse_repos(&args(&["a/b", "c/d"])).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn says_how_old_the_data_is() {
+        let secs = Duration::from_secs;
+        assert_eq!(age_label(secs(0)), "updated 0s ago");
+        assert_eq!(age_label(secs(12)), "updated 12s ago");
+        assert_eq!(age_label(secs(59)), "updated 59s ago");
+        assert_eq!(age_label(secs(60)), "updated 1m ago");
+        assert_eq!(age_label(secs(3599)), "updated 59m ago");
+        assert_eq!(age_label(secs(7200)), "updated 2h ago");
+    }
+
+    #[test]
+    fn a_full_list_may_have_more() {
+        assert_eq!(count_label(0), "0");
+        assert_eq!(count_label(29), "29");
+        assert_eq!(count_label(30), "30+");
     }
 
     #[test]
