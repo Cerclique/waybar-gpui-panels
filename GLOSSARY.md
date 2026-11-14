@@ -8,6 +8,10 @@ Waybar popovers that show the state of GitHub repositories: open issues, open pu
 A GitHub repository, named `owner/name`. Names that differ only in case refer to the same repository.
 _Avoid_: Repo URL, project
 
+**Release**:
+A repository's latest published release, excluding drafts and prereleases.
+_Avoid_: Latest tag, version
+
 **Watch list**:
 The single, ordered list of repositories the user keeps in their config file for the panel to show.
 _Avoid_: Repo list, watched repos, favourites

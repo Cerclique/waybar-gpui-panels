@@ -1,6 +1,6 @@
 //! The `repo` panel: open issues, open pull requests and CI of one repository
-//! at a time, picked from a dropdown. Read-only: a click on a row opens it in
-//! the browser and closes the popover.
+//! at a time, picked from a dropdown, with its latest release in the header.
+//! Read-only: a click on a row opens it in the browser and closes the popover.
 //!
 //! It shows the watch list (see [`watch_list`]), or its panel arguments,
 //! `owner/name …`, when given.
@@ -8,25 +8,28 @@
 //! Data comes from the daemon's [`Cache`]: an open shows the cached status at
 //! once and refreshes it in the background.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime},
+};
 
 use crate::{
     cache::{Cache, Entry},
     mocha,
-    status::{CiState, LIST_LIMIT, Repo},
+    status::{CiState, LIST_LIMIT, Release, Repo},
     watch_list,
 };
 use waybar_gpui::{
     Panel, Theme, card, close,
     components::{
-        Sizable as _,
-        button::{Button, DropdownButton},
+        IconName, Sizable as _,
+        button::{Button, ButtonVariants as _, DropdownButton},
         menu::PopupMenuItem,
         tab::{Tab, TabBar},
     },
     gpui::{
-        self, AnyElement, App, Context, FontWeight, Global, IntoElement, Rgba, SharedString,
-        Subscription, Task, Window, div, prelude::*, px,
+        self, AnyElement, App, ClickEvent, Context, FontWeight, Global, IntoElement, Rgba,
+        SharedString, Subscription, Task, Window, div, prelude::*, px,
     },
 };
 
@@ -116,12 +119,25 @@ impl Render for RepoPanel {
             Ok(repos) => repos,
             Err(e) => return card.child(muted(theme, e.clone())),
         };
+        let repo = &repos[self.selected];
         let header = header(repos, self.selected, cx);
-        let Some(entry) = Cache::get(&repos[self.selected], cx) else {
+        let refresh = refresh_button(repo, cx);
+        let entry = Cache::get(repo, cx);
+        let status = entry
+            .and_then(|e| e.status.as_ref())
+            .map(|(status, _)| status);
+        let header = header
+            .children(
+                status
+                    .and_then(|s| s.release.as_ref())
+                    .map(|r| release_badge(theme, r)),
+            )
+            .child(freshness(theme, entry))
+            .child(refresh.loading(entry.is_some_and(|e| e.refreshing)));
+        let Some(entry) = entry else {
             return card.child(header).child(muted(theme, "Loading…"));
         };
-        let header = header.child(freshness(theme, entry));
-        let Some((status, _)) = &entry.status else {
+        let Some(status) = status else {
             // Nothing cached: the error, if any, fills the panel.
             let message = match &entry.error {
                 Some(e) => e.to_string(),
@@ -130,7 +146,27 @@ impl Render for RepoPanel {
             return card.child(header).child(muted(theme, message));
         };
         let entity = cx.entity();
+        let tab = |label: &'static str, count: String, view: View| {
+            let (bg, fg) = if view == self.view {
+                (
+                    Rgba {
+                        a: 0.18,
+                        ..theme.accent
+                    },
+                    theme.accent,
+                )
+            } else {
+                (theme.surface, theme.subtext)
+            };
+            // The count is a child, not a `suffix`: a suffix sits at the tab's
+            // right edge, outside the centred label.
+            Tab::new()
+                .flex_1()
+                .label(label)
+                .child(div().ml_1p5().child(pill(bg, fg, count)))
+        };
         let tabs = TabBar::new("views")
+            .w_full()
             .underline()
             .small()
             .selected_index(View::ALL.iter().position(|v| *v == self.view).unwrap_or(0))
@@ -140,9 +176,13 @@ impl Render for RepoPanel {
                     cx.notify();
                 })
             })
-            .child(Tab::new().label(format!("Issues {}", count_label(status.issues.len()))))
-            .child(Tab::new().label(format!("PRs {}", count_label(status.pulls.len()))))
-            .child(Tab::new().label(format!("CI {}", status.runs.len())));
+            .child(tab(
+                "Issues",
+                count_label(status.issues.len()),
+                View::Issues,
+            ))
+            .child(tab("PRs", count_label(status.pulls.len()), View::Pulls))
+            .child(tab("CI", status.runs.len().to_string(), View::Ci));
 
         let rows: Vec<AnyElement> = match self.view {
             View::Issues => status
@@ -200,7 +240,7 @@ impl Render for RepoPanel {
         };
         let empty = rows.is_empty();
 
-        card.child(header.children(status.ci_summary().map(ci_pill)))
+        card.child(header)
             .child(tabs)
             .child(
                 div()
@@ -225,6 +265,20 @@ fn age_label(age: Duration) -> String {
     }
 }
 
+/// How long ago a release was published, rounded down to its largest unit.
+fn release_age(age: Duration) -> String {
+    let hours = age.as_secs() / 3600;
+    let days = hours / 24;
+    match days {
+        _ if hours == 0 => "now".to_owned(),
+        0 => format!("{hours}h"),
+        1..7 => format!("{days}d"),
+        7..28 => format!("{}w", days / 7),
+        28..360 => format!("{}mo", (days / 30).max(1)),
+        _ => format!("{}y", (days / 365).max(1)),
+    }
+}
+
 /// A list's length, as `30+` when it hit the fetch limit and may have more.
 fn count_label(len: usize) -> String {
     if len >= LIST_LIMIT {
@@ -234,10 +288,13 @@ fn count_label(len: usize) -> String {
     }
 }
 
-/// The header's note on the shown data: its age, "updating…" while a refresh
-/// runs, and the last refresh's error while cached data stays on screen.
-fn freshness(theme: Theme, entry: &Entry) -> impl IntoElement {
-    let cached = entry.status.as_ref();
+/// The header's note on the shown data: its age, and the last refresh's
+/// error while cached data stays on screen. Fills the header's free space.
+fn freshness(theme: Theme, entry: Option<&Entry>) -> impl IntoElement {
+    let cached = entry.and_then(|e| e.status.as_ref());
+    let error = entry
+        .and_then(|e| e.error.as_ref())
+        .filter(|_| cached.is_some());
     div()
         .flex()
         .flex_1()
@@ -246,8 +303,7 @@ fn freshness(theme: Theme, entry: &Entry) -> impl IntoElement {
         .text_xs()
         .text_color(theme.subtext)
         .when_some(cached, |d, (_, at)| d.child(age_label(at.elapsed())))
-        .when(entry.refreshing, |d| d.child("updating…"))
-        .when_some(entry.error.as_ref().filter(|_| cached.is_some()), |d, e| {
+        .when_some(error, |d, e| {
             d.child(div().text_color(mocha::red()).child(e.to_string()))
         })
 }
@@ -291,9 +347,61 @@ fn header(repos: &[Repo], selected: usize, cx: &mut Context<RepoPanel>) -> gpui:
         .child(picker)
 }
 
+/// Refreshes `repo` now, even if this open already did. Its caller sets
+/// `loading` while a refresh runs.
+fn refresh_button(repo: &Repo, cx: &mut Context<RepoPanel>) -> Button {
+    let entity = cx.entity();
+    let repo = repo.clone();
+    Button::new("refresh")
+        .ghost()
+        .xsmall()
+        .icon(IconName::RefreshCw)
+        .tooltip("Refresh")
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |_, cx| {
+                Cache::refresh(&repo, cx);
+                cx.notify();
+            })
+        })
+}
+
+/// The latest release's tag and age; opens the release page on click.
+fn release_badge(theme: Theme, release: &Release) -> impl IntoElement {
+    let blue = mocha::blue();
+    let age = SystemTime::now()
+        .duration_since(release.published_at)
+        .unwrap_or_default();
+    div()
+        .id("release")
+        .flex()
+        .gap_1()
+        .px_1p5()
+        .rounded_md()
+        .text_xs()
+        .bg(Rgba { a: 0.18, ..blue })
+        .text_color(blue)
+        .cursor_pointer()
+        .hover(|style| style.bg(Rgba { a: 0.32, ..blue }))
+        .on_click(open_and_close(&release.url))
+        .child(release.tag.clone())
+        .child(
+            div()
+                .text_color(theme.subtext)
+                .child(format!("· {}", release_age(age))),
+        )
+}
+
+/// A click handler that opens `url` in the browser, then closes the popover.
+fn open_and_close(url: &str) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let url = url.to_owned();
+    move |_, _, cx| {
+        cx.open_url(&url);
+        close(cx);
+    }
+}
+
 /// A row that opens `url` in the browser on click, then closes the popover.
 fn link_row(theme: Theme, id: String, url: &str) -> gpui::Stateful<gpui::Div> {
-    let url = url.to_owned();
     div()
         .id(SharedString::from(id))
         .flex()
@@ -304,10 +412,7 @@ fn link_row(theme: Theme, id: String, url: &str) -> gpui::Stateful<gpui::Div> {
         .rounded_md()
         .cursor_pointer()
         .hover(|style| style.bg(theme.surface))
-        .on_click(move |_, _, cx: &mut App| {
-            cx.open_url(&url);
-            close(cx);
-        })
+        .on_click(open_and_close(url))
 }
 
 fn number(theme: Theme, number: u64) -> impl IntoElement {
@@ -362,6 +467,32 @@ mod tests {
         assert_eq!(age_label(secs(60)), "updated 1m ago");
         assert_eq!(age_label(secs(3599)), "updated 59m ago");
         assert_eq!(age_label(secs(7200)), "updated 2h ago");
+    }
+
+    #[test]
+    fn rounds_a_release_age_down_to_its_largest_unit() {
+        let mins = |m: u64| Duration::from_secs(m * 60);
+        let hours = |h: u64| mins(h * 60);
+        let days = |d: u64| hours(d * 24);
+        let cases = [
+            (mins(59), "now"),
+            (hours(1), "1h"),
+            (hours(23), "23h"),
+            (hours(24), "1d"),
+            (days(6), "6d"),
+            (days(7), "1w"),
+            (days(27), "3w"),
+            (days(28), "1mo"),
+            (days(59), "1mo"),
+            (days(60), "2mo"),
+            (days(359), "11mo"),
+            (days(360), "1y"),
+            (days(729), "1y"),
+            (days(730), "2y"),
+        ];
+        for (age, shown) in cases {
+            assert_eq!(release_age(age), shown, "{age:?}");
+        }
     }
 
     #[test]

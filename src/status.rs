@@ -1,10 +1,15 @@
-//! A repository's status: open issues, open pull requests and recent CI runs.
+//! A repository's status: open issues, open pull requests, recent CI runs and
+//! the latest release.
 //!
 //! [`load`] is the seam for the data source: it runs `gh … --json` commands
 //! (see `docs/adr/0001-fetch-github-data-through-gh-cli.md`) and parses their
 //! output. It blocks, so it runs on a background thread.
 
-use std::{collections::HashSet, fmt, thread, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt, thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::Deserialize;
 
@@ -65,14 +70,16 @@ pub struct RepoStatus {
     pub issues: Vec<Issue>,
     pub pulls: Vec<PullRequest>,
     pub runs: Vec<WorkflowRun>,
+    /// `None` when the repository has no published release.
+    pub release: Option<Release>,
 }
 
-impl RepoStatus {
-    /// The state of the most recent run on each workflow, worst first:
-    /// what the header shows for CI as a whole. `None` without runs.
-    pub fn ci_summary(&self) -> Option<CiState> {
-        CiState::worst(self.runs.iter().map(|r| r.state))
-    }
+/// The repository's latest published release: no drafts, no prereleases.
+#[derive(Debug, Clone)]
+pub struct Release {
+    pub tag: String,
+    pub published_at: SystemTime,
+    pub url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -161,9 +168,9 @@ pub struct Loaded {
     pub status: RepoStatus,
 }
 
-/// Fetches `repo`'s status: its open issues, open pull requests and the
-/// latest CI run of each workflow on its default branch. Looks the default
-/// branch up first unless `default_branch` already gives it.
+/// Fetches `repo`'s status: its open issues, open pull requests, the latest
+/// CI run of each workflow on its default branch and its latest release.
+/// Looks the default branch up first unless `default_branch` already gives it.
 ///
 /// Blocking; call it off the foreground thread.
 pub fn load(repo: &Repo, default_branch: Option<String>) -> Result<Loaded, GhError> {
@@ -187,8 +194,9 @@ fn fetch_default_branch(repo: &Repo) -> Result<String, GhError> {
     parse_default_branch(&json).map_err(unexpected_output)
 }
 
-/// Runs the three list commands in parallel. Fails as a whole if any one of
-/// them fails, so fresh and stale lists never mix.
+/// Runs the three list commands and the release lookup in parallel. Fails as
+/// a whole if any one of them fails, so fresh and stale data never mix; a
+/// repository without a release isn't a failure.
 fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
     let repo = repo.to_string();
     let limit = LIST_LIMIT.to_string();
@@ -213,7 +221,7 @@ fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
             )
         }
     };
-    let (issues, pulls, runs) = thread::scope(|s| {
+    let (issues, pulls, runs, release) = thread::scope(|s| {
         let issues = s.spawn(list("issue", "number,title,author,labels,url"));
         let pulls = s.spawn(list(
             "pr",
@@ -236,12 +244,31 @@ fn fetch_status(repo: &Repo, branch: &str) -> Result<RepoStatus, GhError> {
                 GH_TIMEOUT,
             )
         });
-        (join(issues), join(pulls), join(runs))
+        let release = s.spawn(|| {
+            run_gh(
+                &[
+                    "release",
+                    "view",
+                    "--repo",
+                    &repo,
+                    "--json",
+                    "tagName,publishedAt,url",
+                ],
+                GH_TIMEOUT,
+            )
+        });
+        (join(issues), join(pulls), join(runs), join(release))
     });
+    let release = match release {
+        Ok(json) => Some(parse_release(&json).map_err(unexpected_output)?),
+        Err(GhError::ReleaseNotFound) => None,
+        Err(e) => return Err(e),
+    };
     Ok(RepoStatus {
         issues: parse_issues(&issues?).map_err(unexpected_output)?,
         pulls: parse_pulls(&pulls?).map_err(unexpected_output)?,
         runs: latest_runs(&runs?).map_err(unexpected_output)?,
+        release,
     })
 }
 
@@ -379,6 +406,54 @@ pub fn latest_runs(json: &str) -> serde_json::Result<Vec<WorkflowRun>> {
             url: r.url,
         })
         .collect())
+}
+
+/// Parses `gh release view --json tagName,publishedAt,url`.
+pub fn parse_release(json: &str) -> serde_json::Result<Release> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct GhRelease {
+        tag_name: String,
+        published_at: String,
+        url: String,
+    }
+    let release: GhRelease = serde_json::from_str(json)?;
+    let published_at = parse_utc(&release.published_at).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "expected a UTC timestamp, got {:?}",
+            release.published_at
+        ))
+    })?;
+    Ok(Release {
+        tag: release.tag_name,
+        published_at,
+        url: release.url,
+    })
+}
+
+/// Parses a UTC timestamp as GitHub prints it: `2024-02-29T23:59:59Z`.
+fn parse_utc(s: &str) -> Option<SystemTime> {
+    let (date, time) = s.strip_suffix('Z')?.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let mut time = time.splitn(3, ':').map(str::parse::<u64>);
+    let (hour, min, sec) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    let days = u64::try_from(days_since_epoch(year, month, day)).ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(days * 86_400 + hour * 3600 + min * 60 + sec))
+}
+
+/// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`).
+fn days_since_epoch(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// Parses `gh repo view --json defaultBranchRef`.
@@ -567,6 +642,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_latest_release_from_gh_release_view() {
+        let release = parse_release(include_str!("fixtures/release.json")).unwrap();
+        assert_eq!(release.tag, "v2.104.0");
+        assert_eq!(
+            release.published_at,
+            UNIX_EPOCH + Duration::from_secs(1_794_510_231)
+        );
+        assert_eq!(
+            release.url,
+            "https://github.com/cli/cli/releases/tag/v2.104.0"
+        );
+    }
+
+    #[test]
+    fn reads_release_dates_across_leap_days() {
+        let published = |at: &str| {
+            let json = format!(r#"{{"tagName":"v1","publishedAt":"{at}","url":"u"}}"#);
+            parse_release(&json).ok().map(|r| r.published_at)
+        };
+        let epoch = |secs| Some(UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(published("2024-02-29T23:59:59Z"), epoch(1_709_251_199));
+        assert_eq!(published("2000-03-01T00:00:00Z"), epoch(951_868_800));
+        assert_eq!(published("yesterday"), None);
+        assert_eq!(published("2024-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
     fn rejects_malformed_json() {
         assert!(parse_issues("not json").is_err());
     }
@@ -603,29 +705,5 @@ mod tests {
         ] {
             assert_eq!(CiState::from_github(v), CiState::Success, "{v}");
         }
-    }
-
-    #[test]
-    fn ci_summary_is_the_worst_run() {
-        let run = |state| WorkflowRun {
-            workflow: "w".into(),
-            branch: "main".into(),
-            state,
-            url: String::new(),
-        };
-        let status = |runs| RepoStatus {
-            issues: vec![],
-            pulls: vec![],
-            runs,
-        };
-        assert_eq!(status(vec![]).ci_summary(), None);
-        assert_eq!(
-            status(vec![run(CiState::Success), run(CiState::Running)]).ci_summary(),
-            Some(CiState::Running)
-        );
-        assert_eq!(
-            status(vec![run(CiState::Failure), run(CiState::Success)]).ci_summary(),
-            Some(CiState::Failure)
-        );
     }
 }

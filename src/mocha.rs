@@ -16,6 +16,10 @@ pub fn red() -> Rgba {
     rgb(0xf38ba8)
 }
 
+pub fn blue() -> Rgba {
+    rgb(0x89b4fa)
+}
+
 pub fn overlay0() -> Rgba {
     rgb(0x6c7086)
 }
