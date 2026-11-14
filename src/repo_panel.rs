@@ -229,7 +229,7 @@ impl Render for RepoPanel {
                                 .text_color(theme.subtext)
                                 .child(run.branch.clone()),
                         )
-                        .child(ci_pill(run.state))
+                        .child(ci_pill(theme, run.state))
                         .into_any_element()
                 })
                 .collect(),
@@ -441,8 +441,9 @@ fn pill(bg: Rgba, fg: Rgba, text: impl Into<SharedString>) -> impl IntoElement {
         .child(text.into())
 }
 
-fn ci_pill(state: CiState) -> impl IntoElement {
+fn ci_pill(theme: Theme, state: CiState) -> impl IntoElement {
     let colour = match state {
+        CiState::Neutral(_) => return pill(theme.surface, mocha::overlay0(), state.label()),
         CiState::Success => mocha::green(),
         CiState::Running => mocha::yellow(),
         CiState::Failure => mocha::red(),
@@ -454,7 +455,7 @@ fn ci_pill(state: CiState) -> impl IntoElement {
 /// row ends in a pill.
 fn checks_pill(theme: Theme, checks: Option<CiState>) -> AnyElement {
     match checks {
-        Some(state) => ci_pill(state).into_any_element(),
+        Some(state) => ci_pill(theme, state).into_any_element(),
         None => pill(theme.surface, mocha::overlay0(), "no checks").into_any_element(),
     }
 }
