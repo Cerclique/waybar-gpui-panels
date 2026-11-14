@@ -108,9 +108,33 @@ pub struct WorkflowRun {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CiState {
+    /// Completed without a verdict (cancelled, skipped, ...). Never failing:
+    /// health checks treat it as passing, but it ranks below `Success` so a
+    /// rollup is neutral only when every check is.
+    Neutral(NeutralKind),
     Success,
     Running,
     Failure,
+}
+
+/// The GitHub conclusion behind a [`CiState::Neutral`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeutralKind {
+    Cancelled,
+    Skipped,
+    Neutral,
+    Stale,
+}
+
+impl NeutralKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+            Self::Neutral => "neutral",
+            Self::Stale => "stale",
+        }
+    }
 }
 
 impl CiState {
@@ -121,7 +145,11 @@ impl CiState {
             "failure" | "timed_out" | "startup_failure" | "action_required" | "error" => {
                 Self::Failure
             }
-            "success" | "neutral" | "skipped" | "cancelled" | "stale" => Self::Success,
+            "success" => Self::Success,
+            "cancelled" => Self::Neutral(NeutralKind::Cancelled),
+            "skipped" => Self::Neutral(NeutralKind::Skipped),
+            "neutral" => Self::Neutral(NeutralKind::Neutral),
+            "stale" => Self::Neutral(NeutralKind::Stale),
             _ => Self::Running,
         }
     }
@@ -133,14 +161,16 @@ impl CiState {
 
     fn severity(self) -> u8 {
         match self {
-            Self::Success => 0,
-            Self::Running => 1,
-            Self::Failure => 2,
+            Self::Neutral(_) => 0,
+            Self::Success => 1,
+            Self::Running => 2,
+            Self::Failure => 3,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::Neutral(kind) => kind.label(),
             Self::Success => "passing",
             Self::Running => "running",
             Self::Failure => "failing",
@@ -576,6 +606,15 @@ mod tests {
             pull(&format!("[{}]", context("SUCCESS"))),
             Some(CiState::Success)
         );
+        let skipped = check("COMPLETED", "SKIPPED");
+        assert_eq!(
+            pull(&format!("[{skipped},{skipped}]")),
+            Some(CiState::Neutral(NeutralKind::Skipped))
+        );
+        assert_eq!(
+            pull(&format!("[{skipped},{success}]")),
+            Some(CiState::Success)
+        );
         assert_eq!(pull("[]"), None);
     }
 
@@ -655,7 +694,39 @@ mod tests {
     }
 
     #[test]
-    fn maps_github_states_onto_three_ci_states() {
+    fn a_rollup_is_neutral_only_when_every_check_is() {
+        let skipped = CiState::Neutral(NeutralKind::Skipped);
+        let cancelled = CiState::Neutral(NeutralKind::Cancelled);
+        assert!(matches!(
+            CiState::worst([skipped, cancelled]),
+            Some(CiState::Neutral(_))
+        ));
+        assert_eq!(
+            CiState::worst([skipped, CiState::Success, cancelled]),
+            Some(CiState::Success)
+        );
+        assert_eq!(
+            CiState::worst([CiState::Running, skipped]),
+            Some(CiState::Running)
+        );
+        assert_eq!(
+            CiState::worst([cancelled, CiState::Failure]),
+            Some(CiState::Failure)
+        );
+    }
+
+    #[test]
+    fn labels_a_neutral_state_with_its_conclusion() {
+        let label = |v| CiState::from_github(v).label();
+        assert_eq!(label("CANCELLED"), "cancelled");
+        assert_eq!(label("skipped"), "skipped");
+        assert_eq!(label("neutral"), "neutral");
+        assert_eq!(label("stale"), "stale");
+        assert_eq!(label("success"), "passing");
+    }
+
+    #[test]
+    fn maps_github_states_onto_ci_states() {
         for v in [
             "queued",
             "in_progress",
@@ -676,15 +747,17 @@ mod tests {
         ] {
             assert_eq!(CiState::from_github(v), CiState::Failure, "{v}");
         }
-        for v in [
-            "success",
-            "neutral",
-            "skipped",
-            "cancelled",
-            "stale",
-            "SKIPPED",
-        ] {
+        for v in ["success", "SUCCESS"] {
             assert_eq!(CiState::from_github(v), CiState::Success, "{v}");
+        }
+        for (v, kind) in [
+            ("cancelled", NeutralKind::Cancelled),
+            ("skipped", NeutralKind::Skipped),
+            ("neutral", NeutralKind::Neutral),
+            ("stale", NeutralKind::Stale),
+            ("SKIPPED", NeutralKind::Skipped),
+        ] {
+            assert_eq!(CiState::from_github(v), CiState::Neutral(kind), "{v}");
         }
     }
 }

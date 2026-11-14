@@ -229,7 +229,7 @@ impl Render for RepoPanel {
                                 .text_color(theme.subtext)
                                 .child(run.branch.clone()),
                         )
-                        .child(ci_pill(run.state))
+                        .child(ci_pill(theme, run.state))
                         .into_any_element()
                 })
                 .collect(),
@@ -441,20 +441,22 @@ fn pill(bg: Rgba, fg: Rgba, text: impl Into<SharedString>) -> impl IntoElement {
         .child(text.into())
 }
 
-fn ci_pill(state: CiState) -> impl IntoElement {
-    let colour = match state {
-        CiState::Success => mocha::green(),
-        CiState::Running => mocha::yellow(),
-        CiState::Failure => mocha::red(),
+fn ci_pill(theme: Theme, state: CiState) -> impl IntoElement {
+    let tinted = |colour: Rgba| (Rgba { a: 0.18, ..colour }, colour);
+    let (bg, fg) = match state {
+        CiState::Neutral(_) => (theme.surface, mocha::overlay0()),
+        CiState::Success => tinted(mocha::green()),
+        CiState::Running => tinted(mocha::yellow()),
+        CiState::Failure => tinted(mocha::red()),
     };
-    pill(Rgba { a: 0.18, ..colour }, colour, state.label())
+    pill(bg, fg, state.label())
 }
 
 /// A pull request's checks; a grey `no checks` pill without CI, so every
 /// row ends in a pill.
 fn checks_pill(theme: Theme, checks: Option<CiState>) -> AnyElement {
     match checks {
-        Some(state) => ci_pill(state).into_any_element(),
+        Some(state) => ci_pill(theme, state).into_any_element(),
         None => pill(theme.surface, mocha::overlay0(), "no checks").into_any_element(),
     }
 }
