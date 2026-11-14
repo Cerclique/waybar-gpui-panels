@@ -14,6 +14,8 @@ pub enum GhError {
     NotInstalled,
     NotLoggedIn,
     RepoNotFound,
+    /// `gh release view` on a repository without a published release.
+    ReleaseNotFound,
     TimedOut,
     Offline,
     /// Anything else: the first line of `gh`'s error output.
@@ -26,6 +28,7 @@ impl fmt::Display for GhError {
             Self::NotInstalled => f.write_str("gh not installed"),
             Self::NotLoggedIn => f.write_str("run `gh auth login`"),
             Self::RepoNotFound => f.write_str("repo not found"),
+            Self::ReleaseNotFound => f.write_str("release not found"),
             Self::TimedOut => f.write_str("timed out"),
             Self::Offline => f.write_str("offline"),
             Self::Other(line) => f.write_str(line),
@@ -43,6 +46,8 @@ impl GhError {
             Self::NotLoggedIn
         } else if has("Could not resolve to a Repository") || has("HTTP 404") {
             Self::RepoNotFound
+        } else if has("release not found") {
+            Self::ReleaseNotFound
         } else if has("error connecting to") || has("no such host") || has("network is unreachable")
         {
             Self::Offline
@@ -141,6 +146,7 @@ mod tests {
                 "\nHTTP 502: Bad Gateway\nsecond line\n",
                 GhError::Other("HTTP 502: Bad Gateway".to_owned()),
             ),
+            ("release not found\n", GhError::ReleaseNotFound),
             ("", GhError::Other("gh failed".to_owned())),
         ];
         for (stderr, expected) in cases {
