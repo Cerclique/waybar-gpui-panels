@@ -131,7 +131,12 @@ fn path_in(xdg_config_home: Option<&OsStr>, home: Option<&Path>) -> Option<PathB
         Some(dir) if dir.is_absolute() => dir.to_owned(),
         _ => home?.join(".config"),
     };
-    Some(config.join("waybar-gpui-panels").join("github").join("repos"))
+    Some(
+        config
+            .join("waybar-gpui-panels")
+            .join("github")
+            .join("repos"),
+    )
 }
 
 #[cfg(test)]
