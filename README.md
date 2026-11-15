@@ -144,7 +144,7 @@ cargo test
 cargo clippy --all-targets
 ```
 
-Terms used in the code are defined in [GLOSSARY.md](GLOSSARY.md).
+Terms used in the code are defined in [GLOSSARY.md](docs/GLOSSARY.md).
 
 ### Claude Code skill
 
