@@ -1,5 +1,5 @@
-//! The watch list: the repositories the `repo` panel shows, read from
-//! `$XDG_CONFIG_HOME/waybar-github-viewer/repos` unless panel arguments
+//! The watch list: the repositories the `github` panel shows, read from
+//! `$XDG_CONFIG_HOME/waybar-gpui-panels/github/repos` unless panel arguments
 //! replace it.
 
 use std::{
@@ -131,7 +131,7 @@ fn path_in(xdg_config_home: Option<&OsStr>, home: Option<&Path>) -> Option<PathB
         Some(dir) if dir.is_absolute() => dir.to_owned(),
         _ => home?.join(".config"),
     };
-    Some(config.join("waybar-github-viewer").join("repos"))
+    Some(config.join("waybar-gpui-panels").join("github").join("repos"))
 }
 
 #[cfg(test)]
@@ -148,14 +148,14 @@ mod tests {
 # work
 Cerclique/waybar-gpui
 
-https://github.com/Cerclique/waybar_github_viewer  # this one
+https://github.com/Cerclique/waybar-gpui-panels  # this one
    git@github.com:rust-lang/rust.git
 ";
         assert_eq!(
             names(&parse(text, "repos").unwrap()),
             [
                 "Cerclique/waybar-gpui",
-                "Cerclique/waybar_github_viewer",
+                "Cerclique/waybar-gpui-panels",
                 "rust-lang/rust",
             ]
         );
@@ -211,13 +211,13 @@ https://github.com/Cerclique/waybar_github_viewer  # this one
         let home = Some(Path::new("/home/me"));
         assert_eq!(
             path_in(Some("/cfg".as_ref()), home).unwrap(),
-            Path::new("/cfg/waybar-github-viewer/repos")
+            Path::new("/cfg/waybar-gpui-panels/github/repos")
         );
         // Unset, empty or relative XDG_CONFIG_HOME falls back to ~/.config.
         for xdg in [None, Some(""), Some("relative/cfg")] {
             assert_eq!(
                 path_in(xdg.map(AsRef::as_ref), home).unwrap(),
-                Path::new("/home/me/.config/waybar-github-viewer/repos"),
+                Path::new("/home/me/.config/waybar-gpui-panels/github/repos"),
                 "{xdg:?}"
             );
         }
@@ -227,7 +227,7 @@ https://github.com/Cerclique/waybar_github_viewer  # this one
     /// A fresh directory for one test's watch list file.
     fn temp_dir(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "waybar-github-viewer-{}-{test}",
+            "waybar-gpui-panels-github-{}-{test}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
