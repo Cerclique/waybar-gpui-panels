@@ -1,0 +1,10 @@
+[package]
+name = "waybar-gpui-panels"
+description = "GPUI popover panels for Waybar on Hyprland"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+panel-github.workspace = true
+waybar_gpui.workspace = true

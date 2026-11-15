@@ -1,4 +1,4 @@
-//! The `repo` panel: open issues, open pull requests and CI of one repository
+//! The `github` panel: open issues, open pull requests and CI of one repository
 //! at a time, picked from a dropdown, with its latest release in the header.
 //! Read-only: a click on a row opens it in the browser and closes the popover.
 //! CI is a tree of workflows, each expanding to its recent runs.
@@ -86,7 +86,7 @@ pub struct RepoPanel {
 }
 
 impl Panel for RepoPanel {
-    const NAME: &'static str = "repo";
+    const NAME: &'static str = "github";
 
     fn new(args: &[String], _: &mut Window, cx: &mut Context<Self>) -> Self {
         let repos = watch_list::load(args, watch_list::default_path().as_deref());

@@ -4376,6 +4376,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "panel-github"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "waybar_gpui",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6839,11 +6848,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "waybar_github_viewer"
+name = "waybar-gpui-panels"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
+ "panel-github",
  "waybar_gpui",
 ]
 

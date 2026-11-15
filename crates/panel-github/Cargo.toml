@@ -1,0 +1,11 @@
+[package]
+name = "panel-github"
+description = "Waybar popover showing the state of GitHub repositories: issues, pull requests and CI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+waybar_gpui.workspace = true
