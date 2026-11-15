@@ -122,6 +122,21 @@ The bar text is static: data is fetched only when the popover opens.
 
 Run `waybar-gpui-panels --help` for the full list.
 
+## Uninstall
+
+Stop the daemon first (it keeps running from the deleted binary otherwise),
+then remove the program:
+
+```sh
+waybar-gpui-panels quit
+cargo uninstall waybar-gpui-panels
+```
+
+Then delete the `custom/github` modules (and their entries in `modules-left`,
+`modules-center` or `modules-right`) from your Waybar config, and reload Waybar
+(`pkill -SIGUSR2 waybar`). Your watch list stays in
+`~/.config/waybar-gpui-panels/`; delete that directory too if you want it gone.
+
 ## Development
 
 ```sh
